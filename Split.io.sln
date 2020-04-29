@@ -16,6 +16,8 @@ Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "Splitio-net-core.Integratio
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "PushSupportNetFramework472", "PushSupportNetFramework472\PushSupportNetFramework472.csproj", "{2A2037E8-519F-4943-8308-89493442F75A}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "PushSupportNetCore22", "PushSupportNetCore22\PushSupportNetCore22.csproj", "{3056EB44-A7E9-47A3-AE0B-C45AC9F0D068}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -46,6 +48,10 @@ Global
 		{2A2037E8-519F-4943-8308-89493442F75A}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{2A2037E8-519F-4943-8308-89493442F75A}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{2A2037E8-519F-4943-8308-89493442F75A}.Release|Any CPU.Build.0 = Release|Any CPU
+		{3056EB44-A7E9-47A3-AE0B-C45AC9F0D068}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{3056EB44-A7E9-47A3-AE0B-C45AC9F0D068}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{3056EB44-A7E9-47A3-AE0B-C45AC9F0D068}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{3056EB44-A7E9-47A3-AE0B-C45AC9F0D068}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

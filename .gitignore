@@ -34,3 +34,6 @@ Splitio-net-frameworks-tests/obj/
 /PushSupportNetFramework472/Content
 /PushSupportNetFramework472/Scripts
 /PushSupportNetFramework472/fonts
+/PushSupportNetCore22/bin/Debug/netcoreapp2.2
+/PushSupportNetCore22/obj
+/PushSupportNetCore22/wwwroot
