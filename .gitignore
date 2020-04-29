@@ -29,3 +29,8 @@ Splitio-net-frameworks-tests/bin/
 Splitio-net-frameworks-tests/obj/
 /Splitio-net-core.Integration-tests/bin
 /Splitio-net-core.Integration-tests/obj
+/PushSupportNetFramework472/bin
+/PushSupportNetFramework472/obj/Debug
+/PushSupportNetFramework472/Content
+/PushSupportNetFramework472/Scripts
+/PushSupportNetFramework472/fonts
