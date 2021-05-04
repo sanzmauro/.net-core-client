@@ -54,10 +54,15 @@ namespace Splitio_Tests.Unit_Tests.Common
                 .ReturnsAsync(response)
                 .ReturnsAsync(response2);
 
+            _sseHandler
+                .Setup(mock => mock.Start(It.IsAny<string>(), It.IsAny<string>()))
+                .Returns(true);
+
             // Act.
-            _pushManager.StartSse();
+            var result = _pushManager.StartSse();
 
             // Assert.
+            Assert.IsTrue(result.Result);
             _authApiClient.Verify(mock => mock.AuthenticateAsync(), Times.Once);
             _sseHandler.Verify(mock => mock.Start(response.Token, response.Channels), Times.Once);
 
@@ -81,9 +86,10 @@ namespace Splitio_Tests.Unit_Tests.Common
                 .ReturnsAsync(response);
 
             // Act.
-            _pushManager.StartSse();
+            var result = _pushManager.StartSse();
 
             // Assert.
+            Assert.IsFalse(result.Result);
             _authApiClient.Verify(mock => mock.AuthenticateAsync(), Times.Once);
             _sseHandler.Verify(mock => mock.Start(It.IsAny<string>(), It.IsAny<string>()), Times.Never);
             _sseHandler.Verify(mock => mock.Stop(), Times.Once);
@@ -119,9 +125,10 @@ namespace Splitio_Tests.Unit_Tests.Common
                 .ReturnsAsync(response2);
 
             // Act.
-            _pushManager.StartSse();
+            var result = _pushManager.StartSse();
 
             // Assert.
+            Assert.IsFalse(result.Result);
             _authApiClient.Verify(mock => mock.AuthenticateAsync(), Times.Once);
             _sseHandler.Verify(mock => mock.Start(It.IsAny<string>(), It.IsAny<string>()), Times.Never);
             _sseHandler.Verify(mock => mock.Stop(), Times.Once);

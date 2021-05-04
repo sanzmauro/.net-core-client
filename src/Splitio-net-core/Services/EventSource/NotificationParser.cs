@@ -1,6 +1,5 @@
 ﻿using Newtonsoft.Json;
 using Splitio.Domain;
-using Splitio.Services.Exceptions;
 using System;
 
 namespace Splitio.Services.EventSource
@@ -15,7 +14,7 @@ namespace Splitio.Services.EventSource
             {
                 if (notification.Contains(Constans.PushOccupancyPrefix))
                 {
-                    return ParseOccupancy(notification);
+                    return ParseControlChannelMessage(notification);
                 }
 
                 return ParseMessage(notification);
@@ -46,9 +45,6 @@ namespace Splitio.Services.EventSource
                 case NotificationType.SEGMENT_UPDATE:
                     result = JsonConvert.DeserializeObject<SegmentChangeNotification>(notificationData.Data);
                     break;
-                case NotificationType.CONTROL:
-                    result = JsonConvert.DeserializeObject<ControlNotification>(notificationData.Data);
-                    break;
                 default:
                     return null;
             }
@@ -58,17 +54,32 @@ namespace Splitio.Services.EventSource
             return result;
         }
 
-        private IncomingNotification ParseOccupancy(string notificationString)
+        private IncomingNotification ParseControlChannelMessage(string notificationString)
         {
             var notificationData = GetNotificationData<NotificationData>(notificationString);
+            var channel = notificationData.Channel.Replace(Constans.PushOccupancyPrefix, string.Empty);
 
-            var occupancyNotification = JsonConvert.DeserializeObject<OccupancyNotification>(notificationData.Data);
+            if (notificationData.Data.Contains("controlType"))
+            {
+                var controlNotification = JsonConvert.DeserializeObject<ControlNotification>(notificationData.Data);
+                controlNotification.Type = NotificationType.CONTROL;
+                controlNotification.Channel = channel;
+
+                return controlNotification;
+            }
+
+            return ParseOccupancy(notificationData.Data, channel);
+        }
+
+        private IncomingNotification ParseOccupancy(string payload, string channel)
+        {
+            var occupancyNotification = JsonConvert.DeserializeObject<OccupancyNotification>(payload);
 
             if (occupancyNotification?.Metrics == null)
                 return null;
 
             occupancyNotification.Type = NotificationType.OCCUPANCY;
-            occupancyNotification.Channel = notificationData.Channel.Replace(Constans.PushOccupancyPrefix, string.Empty);
+            occupancyNotification.Channel = channel;
 
             return occupancyNotification;
         }
@@ -77,10 +88,12 @@ namespace Splitio.Services.EventSource
         {
             var notificatinError = GetNotificationData<NotificationError>(notificationString);
 
-            if (notificatinError.Message != null)
-                throw new NotificationErrorException(notificatinError);
+            if (notificatinError.Message == null)
+                return null;
 
-            return null;
+            notificatinError.Type = NotificationType.ERROR;
+
+            return notificatinError;
         }
 
         private T GetNotificationData<T>(string notificationString)

@@ -1,5 +1,4 @@
 ﻿using Splitio.Services.Common;
-using Splitio.Services.Exceptions;
 using Splitio.Services.Logger;
 using Splitio.Services.Shared.Classes;
 using Splitio.Services.Shared.Interfaces;
@@ -16,242 +15,268 @@ namespace Splitio.Services.EventSource
     public class EventSourceClient : IEventSourceClient
     {
         private const string KeepAliveResponse = ":keepalive\n\n";
-        private const int ReadTimeout = 70;
+        private const int ReadTimeoutMs = 70000;
+        private const int ConnectTimeoutMs = 30000;
         private const int BufferSize = 10000;
 
         private readonly ISplitLogger _log;
         private readonly INotificationParser _notificationParser;
-        private readonly IBackOff _backOff;
         private readonly IWrapperAdapter _wrapperAdapter;
+        private readonly CountdownEvent _disconnectSignal;
+        private readonly CountdownEvent _connectedSignal;
 
-        private readonly object _connectedLock = new object();
+        private string _url;
         private bool _connected;
-
-        private readonly object _finishedConnectionLock = new object();
-        private bool _finishedConnection;
+        private bool _firstEvent;
 
         private ISplitioHttpClient _splitHttpClient;
         private CancellationTokenSource _cancellationTokenSource;
-        private string _url;
+        private CancellationTokenSource _streamReadcancellationTokenSource;        
 
-        public EventSourceClient(int backOffBase,
-            ISplitLogger log = null,
+        public EventSourceClient(ISplitLogger log = null,
             INotificationParser notificationParser = null,
-            IBackOff backOff = null,
             IWrapperAdapter wrapperAdapter = null)
         {
             _log = log ?? WrapperAdapter.GetLogger(typeof(EventSourceClient));
             _notificationParser = notificationParser ?? new NotificationParser();
-            _backOff = backOff ?? new BackOff(backOffBase);
             _wrapperAdapter = wrapperAdapter ?? new WrapperAdapter();
 
-            UpdateFinishedConnection(finished: true);
+            _disconnectSignal = new CountdownEvent(1);
+            _connectedSignal = new CountdownEvent(1);
+            _firstEvent = true;
         }
 
         public event EventHandler<EventReceivedEventArgs> EventReceived;
-        public event EventHandler<FeedbackEventArgs> ConnectedEvent;
-        public event EventHandler<FeedbackEventArgs> DisconnectEvent;
+        public event EventHandler<SSEActionsEventArgs> ActionEvent;
 
         #region Public Methods
-        public async Task ConnectAsync(string url)
+        public bool ConnectAsync(string url)
         {
-            _url = url;
-
-            while (!IsConnectionFinished())
+            if (IsConnected())
             {
-                // Wait until current connection ends.
-                _wrapperAdapter.TaskDelay(1000).Wait();
+                _log.Debug("Event source Client already connected.");
+                return false;
             }
 
-            await ConnectAsync();
+            _firstEvent = true;
+            _url = url;
+            _disconnectSignal.Reset();
+            _connectedSignal.Reset();
+
+            Task.Factory.StartNew(() => ConnectAsync());
+
+            try
+            {
+                if (!_connectedSignal.Wait(ConnectTimeoutMs))
+                {
+                    return false;
+                }
+            }
+            catch (Exception ex)
+            {
+                _log.Debug(ex.Message);
+                return false;
+            }
+
+            return IsConnected();
         }
 
         public bool IsConnected()
         {
-            lock (_connectedLock)
-            {
-                return _connected;
-            }
+            return _connected;
         }
 
-        public void Disconnect(bool reconnect = false)
+        public void Disconnect(SSEClientActions action = SSEClientActions.DISCONNECT)
         {
             if (_cancellationTokenSource.IsCancellationRequested) return;
 
+            _streamReadcancellationTokenSource.Cancel();
             _cancellationTokenSource.Cancel();
             _cancellationTokenSource.Dispose();
             _splitHttpClient.Dispose();
+            
+            _connected = false;
 
-            if (_backOff.GetAttempt() == 0)
-            {
-                DispatchDisconnect(reconnect);
-            }
-            UpdateStatus(connected: false);
-            _log.Info($"Disconnected from {_url}");
+            _disconnectSignal.Wait(ReadTimeoutMs);
+
+            DispatchActionEvent(action);
+            _log.Debug($"Disconnected from {_url}");
         }
         #endregion
 
         #region Private Methods
         private async Task ConnectAsync()
         {
+            var action = SSEClientActions.DISCONNECT;
+
             try
             {
-                _wrapperAdapter.TaskDelay(Convert.ToInt32(_backOff.GetInterval()) * 1000).Wait();
-
                 _splitHttpClient = new SplitioHttpClient(new Dictionary<string, string> { { "Accept", "text/event-stream" } });
                 _cancellationTokenSource = new CancellationTokenSource();
 
                 using (var response = await _splitHttpClient.GetAsync(_url, HttpCompletionOption.ResponseHeadersRead, _cancellationTokenSource.Token))
                 {
-                    UpdateFinishedConnection(finished: false);
-                    try
-                    {
-                        using (var stream = await response.Content.ReadAsStreamAsync())
-                        {
-                            _log.Info($"Connected to {_url}");
+                    _log.Debug($"Response from {_url}: {response.StatusCode}");
 
-                            UpdateStatus(connected: true);
-                            _backOff.Reset();
-                            DispatchConnected();
-                            await ReadStreamAsync(stream);
-                        }
-                    }
-                    catch (Exception ex)
+                    if (response.IsSuccessStatusCode)
                     {
-                        _log.Error($"Error reading stream: {ex.Message}");
-                        ReconnectAsync();
+                        try
+                        {
+                            using (var stream = await response.Content.ReadAsStreamAsync())
+                            {
+                                _log.Info($"Connected to {_url}");
+
+                                await ReadStreamAsync(stream);
+                            }
+                        }
+                        catch (ReadStreamException ex)
+                        {
+                            _log.Debug(ex.Message);
+                            action = ex.Action;
+                        }
+                        catch (Exception ex)
+                        {
+                            _log.Debug($"Error reading stream: {ex.Message}");
+                            action = SSEClientActions.RETRYABLE_ERROR;
+                        }
                     }
                 }
             }
             catch (Exception ex)
             {
-                _log.Error($"Error connecting to {_url}: {ex.Message}");
+                _log.Debug($"Error connecting to {_url}: {ex.Message}");
             }
+            finally
+            {
+                _disconnectSignal.Signal();
+                Disconnect(action);                
 
-            _log.Debug("Finished Event Source client ConnectAsync.");
-            Disconnect();
-            UpdateFinishedConnection(finished: true);
+                _log.Debug("Finished Event Source client ConnectAsync.");
+            }            
         }
 
         private async Task ReadStreamAsync(Stream stream)
         {
             var encoder = new UTF8Encoding();
-            var streamReadcancellationTokenSource = new CancellationTokenSource();
+            _streamReadcancellationTokenSource = new CancellationTokenSource();
 
             _log.Debug($"Reading stream ....");
 
-            while (!_cancellationTokenSource.IsCancellationRequested && IsConnected())
+            try
             {
-                if (stream.CanRead && IsConnected())
+                while (!_streamReadcancellationTokenSource.IsCancellationRequested && (IsConnected() || _firstEvent))
                 {
-                    var buffer = new byte[BufferSize];
-
-                    var timeoutTask = _wrapperAdapter.TaskDelay(ReadTimeout * 1000);
-                    var streamReadTask = stream.ReadAsync(buffer, 0, BufferSize, streamReadcancellationTokenSource.Token);
-                    // Creates a task that will complete when any of the supplied tasks have completed.
-                    // Returns: A task that represents the completion of one of the supplied tasks. The return task's Result is the task that completed.
-                    var finishedTask = await _wrapperAdapter.WhenAny(streamReadTask, timeoutTask);
-
-                    if (finishedTask == timeoutTask) throw new Exception($"Streaming read time out after {ReadTimeout} seconds.");
-
-                    int len = streamReadTask.Result;
-
-                    if (len == 0) throw new Exception($"Streaming end of the file.");
-
-                    var notificationString = encoder.GetString(buffer, 0, len);
-                    _log.Debug($"Read stream encoder buffer: {notificationString}");
-
-                    if (notificationString != KeepAliveResponse && IsConnected())
+                    if (stream.CanRead && (IsConnected() || _firstEvent))
                     {
-                        var lines = notificationString.Split(new[] { "\n\n" }, StringSplitOptions.None);
+                        var buffer = new byte[BufferSize];
 
-                        foreach (var line in lines)
+                        var timeoutTask = _wrapperAdapter.TaskDelay(ReadTimeoutMs);
+                        var streamReadTask = stream.ReadAsync(buffer, 0, BufferSize, _streamReadcancellationTokenSource.Token);
+                        // Creates a task that will complete when any of the supplied tasks have completed.
+                        // Returns: A task that represents the completion of one of the supplied tasks. The return task's Result is the task that completed.
+                        var finishedTask = await _wrapperAdapter.WhenAny(streamReadTask, timeoutTask);
+
+                        if (finishedTask == timeoutTask)
                         {
-                            try
+                            throw new ReadStreamException(SSEClientActions.RETRYABLE_ERROR, $"Streaming read time out after {ReadTimeoutMs} seconds.");
+                        }
+                        
+                        int len = streamReadTask.Result;
+
+                        if (len == 0)
+                        {
+                            throw new ReadStreamException(SSEClientActions.RETRYABLE_ERROR, "Streaming end of the file.");
+                        }
+
+                        var notificationString = encoder.GetString(buffer, 0, len);
+                        _log.Debug($"Read stream encoder buffer: {notificationString}");
+
+                        if (_firstEvent)
+                        {
+                            ProcessFirtsEvent(notificationString);
+                        }
+
+                        if (notificationString != KeepAliveResponse && IsConnected())
+                        {
+                            var lines = notificationString.Split(new[] { "\n\n" }, StringSplitOptions.None);
+
+                            foreach (var line in lines)
                             {
                                 if (!string.IsNullOrEmpty(line))
                                 {
                                     var eventData = _notificationParser.Parse(line);
 
-                                    if (eventData != null) DispatchEvent(eventData);
+                                    if (eventData != null)
+                                    {
+                                        if (eventData.Type == NotificationType.ERROR)
+                                        {
+                                            var notificationError = (NotificationError)eventData;
+
+                                            ProcessErrorNotification(notificationError);
+                                        }
+                                        else
+                                        {
+                                            DispatchEvent(eventData);
+                                        }
+                                    }
                                 }
-                            }
-                            catch (NotificationErrorException ex)
-                            {
-                                _log.Debug($"Notification error: {ex.Message}. Status Server: {ex.Notification.StatusCode}.");
-                                Disconnect(reconnect: true);
-                            }
-                            catch (Exception ex)
-                            {
-                                _log.Debug($"Error during event parse: {ex.Message}");
                             }
                         }
                     }
                 }
             }
+            catch (ReadStreamException ex)
+            {
+                _log.Debug($"ReadStreamException: {ex.Message}");
+                throw ex;
+            }
+            catch (Exception ex)
+            {
+                _log.Debug($"Stream Token canceled. {ex.Message}");
+            }
+            finally
+            {
+                _log.Debug($"Stop read stream");
+            }
+        }
 
-            _log.Debug($"Stop read stream");
+        private void ProcessErrorNotification(NotificationError notificationError)
+        {
+            _log.Debug($"Notification error: {notificationError.Message}. Status Server: {notificationError.StatusCode}.");
+
+            if (notificationError.Code >= 40140 && notificationError.Code <= 40149)
+            {
+                throw new ReadStreamException(SSEClientActions.RETRYABLE_ERROR, $"Ably Notification code: {notificationError.Code}");
+            }
+
+            if (notificationError.Code >= 40000 && notificationError.Code <= 49999)
+            {
+                throw new ReadStreamException(SSEClientActions.NONRETRYABLE_ERROR, $"Ably Notification code: {notificationError.Code}");
+            }
         }
 
         private void DispatchEvent(IncomingNotification incomingNotification)
         {
             _log.Debug($"DispatchEvent: {incomingNotification}");
-            OnEvent(new EventReceivedEventArgs(incomingNotification));
+            EventReceived?.Invoke(this, new EventReceivedEventArgs(incomingNotification));
         }
 
-        private void DispatchDisconnect(bool reconnect = false)
+        private void DispatchActionEvent(SSEClientActions action)
         {
-            OnDisconnect(new FeedbackEventArgs(isConnected: false, reconnect: reconnect));
+            ActionEvent?.Invoke(this, new SSEActionsEventArgs(action));
         }
 
-        private void DispatchConnected()
+        private void ProcessFirtsEvent(string notification)
         {
-            OnConnected(new FeedbackEventArgs(isConnected: true));
-        }
+            _firstEvent = false;
+            var eventData = _notificationParser.Parse(notification);
 
-        private void OnEvent(EventReceivedEventArgs e)
-        {
-            EventReceived?.Invoke(this, e);
-        }
+            // This case is when in the first event received an error notification, mustn't dispatch connected.
+            if (eventData != null && eventData.Type == NotificationType.ERROR) return;
 
-        private void OnConnected(FeedbackEventArgs e)
-        {
-            ConnectedEvent?.Invoke(this, e);
-        }
-
-        private void OnDisconnect(FeedbackEventArgs e)
-        {
-            DisconnectEvent?.Invoke(this, e);
-        }
-
-        private void ReconnectAsync()
-        {
-            Disconnect();
-            Task.Factory.StartNew(() => ConnectAsync(_url));
-        }
-
-        private void UpdateStatus(bool connected)
-        {
-            lock (_connectedLock)
-            {
-                _connected = connected;
-            }
-        }
-
-        private void UpdateFinishedConnection(bool finished)
-        {
-            lock (_finishedConnectionLock)
-            {
-                _finishedConnection = finished;
-            }
-        }
-
-        private bool IsConnectionFinished()
-        {
-            lock (_finishedConnectionLock)
-            {
-                return _finishedConnection;
-            }
+            _connected = true;
+            _connectedSignal.Signal();
+            DispatchActionEvent(SSEClientActions.CONNECTED);            
         }
         #endregion
     }

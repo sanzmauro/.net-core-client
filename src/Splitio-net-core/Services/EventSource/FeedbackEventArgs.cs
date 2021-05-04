@@ -2,15 +2,13 @@
 
 namespace Splitio.Services.EventSource
 {
-    public class FeedbackEventArgs : EventArgs
+    public class SSEActionsEventArgs : EventArgs
     {
-        public bool IsConnected { get; }
-        public bool Reconnect { get; } 
+        public SSEClientActions Action { get; }
 
-        public FeedbackEventArgs(bool isConnected, bool reconnect = false)
+        public SSEActionsEventArgs(SSEClientActions action)
         {
-            IsConnected = isConnected;
-            Reconnect = reconnect;
+            Action = action;
         }
     }
 }

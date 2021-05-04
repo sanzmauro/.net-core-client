@@ -16,8 +16,7 @@ namespace Splitio.Services.EventSource
 
         private IEventSourceClient _eventSourceClient;
 
-        public event EventHandler<FeedbackEventArgs> ConnectedEvent;
-        public event EventHandler<FeedbackEventArgs> DisconnectEvent;
+        public event EventHandler<SSEActionsEventArgs> ActionEvent;
 
         public SSEHandler(string streaminServiceUrl,
             ISplitsWorker splitsWorker,
@@ -36,24 +35,25 @@ namespace Splitio.Services.EventSource
             _eventSourceClient = eventSourceClient;
 
             _eventSourceClient.EventReceived += EventReceived;
-            _eventSourceClient.ConnectedEvent += OnConnected;
-            _eventSourceClient.DisconnectEvent += OnDisconnect;
+            _eventSourceClient.ActionEvent += OnAction;
         }
 
-        #region Private Methods
-        public void Start(string token, string channels)
+        #region Public Methods
+        public bool Start(string token, string channels)
         {
             try
             {
                 _log.Debug($"SSE Handler starting...");
                 var url = $"{_streaminServiceUrl}?channels={channels}&v=1.1&accessToken={token}";
 
-                _eventSourceClient.ConnectAsync(url);
+                return _eventSourceClient.ConnectAsync(url);
             }
             catch (Exception ex)
             {
                 _log.Error($"SSE Handler Start: {ex.Message}");
             }
+
+            return false;
         }
 
         public void Stop()
@@ -69,7 +69,6 @@ namespace Splitio.Services.EventSource
             catch (Exception ex)
             {
                 _log.Debug($"SSE Handler Stop: {ex.Message}");
-                DisconnectEvent?.Invoke(this, new FeedbackEventArgs(false));
             }
         }
 
@@ -101,16 +100,9 @@ namespace Splitio.Services.EventSource
             }
         }
 
-        private void OnConnected(object sender, FeedbackEventArgs e)
+        private void OnAction(object sender, SSEActionsEventArgs e)
         {
-            StartWorkers();
-            ConnectedEvent?.Invoke(this, e);
-        }
-
-        private void OnDisconnect(object sender, FeedbackEventArgs e)
-        {
-            StopWorkers();
-            DisconnectEvent?.Invoke(this, e);
+            ActionEvent?.Invoke(this, e);
         }
         #endregion
     }

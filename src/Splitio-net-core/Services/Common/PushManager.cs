@@ -3,6 +3,8 @@ using Splitio.Services.Logger;
 using Splitio.Services.Shared.Classes;
 using Splitio.Services.Shared.Interfaces;
 using System;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace Splitio.Services.Common
 {
@@ -13,6 +15,9 @@ namespace Splitio.Services.Common
         private readonly IWrapperAdapter _wrapperAdapter;
         private readonly ISSEHandler _sseHandler;
         private readonly IBackOff _backOff;
+
+        private CancellationTokenSource _cancellationTokenSourceRefreshToken;
+        private Task _refreshTokenTask;
 
         public PushManager(int authRetryBackOffBase,
             ISSEHandler sseHandler,
@@ -29,7 +34,7 @@ namespace Splitio.Services.Common
         }
 
         #region Public Methods
-        public async void StartSse()
+        public async Task<bool> StartSse()
         {
             try
             {
@@ -37,25 +42,30 @@ namespace Splitio.Services.Common
 
                 _log.Debug($"Auth service response pushEnabled: {response.PushEnabled}.");
 
-                if (response.PushEnabled.Value)
-                {
-                    _sseHandler.Start(response.Token, response.Channels);
+                if (response.PushEnabled.Value && _sseHandler.Start(response.Token, response.Channels))
+                {                    
+                    _backOff.Reset();
                     ScheduleNextTokenRefresh(response.Expiration.Value);
-                }
-                else
-                {
-                    StopSse();
-                }
+                    return true;
+                }                
+                
+                StopSse();
 
                 if (response.Retry.Value)
                 {
                     ScheduleNextTokenRefresh(_backOff.GetInterval());
+                }
+                else
+                {
+                    ForceCancellationToken();
                 }
             }
             catch (Exception ex)
             {
                 _log.Error($"StartSse: {ex.Message}");
             }
+
+            return false;
         }
 
         public void StopSse()
@@ -76,22 +86,31 @@ namespace Splitio.Services.Common
         {
             try
             {
+                ForceCancellationToken();
+                _cancellationTokenSourceRefreshToken = new CancellationTokenSource();
+
                 var sleepTime = Convert.ToInt32(time) * 1000;
                 _log.Debug($"ScheduleNextTokenRefresh sleep time : {sleepTime} miliseconds.");
 
-                _wrapperAdapter
+                _refreshTokenTask = _wrapperAdapter
                     .TaskDelay(sleepTime)
                     .ContinueWith((t) =>
                     {
                         _log.Debug("Starting ScheduleNextTokenRefresh ...");
                         StopSse();
                         StartSse();
-                    });
+                    }, _cancellationTokenSourceRefreshToken.Token);
             }
             catch (Exception ex)
             {
                 _log.Error($"ScheduleNextTokenRefresh: {ex.Message}");
             }
+        }
+
+        private void ForceCancellationToken()
+        {
+            if (_cancellationTokenSourceRefreshToken != null)
+                _cancellationTokenSourceRefreshToken.Cancel();            
         }
         #endregion
     }

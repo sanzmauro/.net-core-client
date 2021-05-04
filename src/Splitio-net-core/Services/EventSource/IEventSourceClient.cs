@@ -1,16 +1,14 @@
 ﻿using System;
-using System.Threading.Tasks;
 
 namespace Splitio.Services.EventSource
 {
     public interface IEventSourceClient
     {
-        Task ConnectAsync(string url);
-        void Disconnect(bool reconnect = false);
+        bool ConnectAsync(string url);
+        void Disconnect(SSEClientActions action = SSEClientActions.DISCONNECT);
         bool IsConnected();
         
         event EventHandler<EventReceivedEventArgs> EventReceived;
-        event EventHandler<FeedbackEventArgs> ConnectedEvent;
-        event EventHandler<FeedbackEventArgs> DisconnectEvent;
+        event EventHandler<SSEActionsEventArgs> ActionEvent;
     }
 }

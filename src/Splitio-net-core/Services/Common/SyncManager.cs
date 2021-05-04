@@ -1,7 +1,7 @@
 ﻿using Splitio.Services.EventSource;
 using Splitio.Services.Logger;
 using Splitio.Services.Shared.Classes;
-using System;
+using System.Threading.Tasks;
 
 namespace Splitio.Services.Common
 {
@@ -12,6 +12,8 @@ namespace Splitio.Services.Common
         private readonly IPushManager _pushManager;
         private readonly ISSEHandler _sseHandler;
         private readonly ISplitLogger _log;
+
+        private bool _streamingConnected;
 
         public SyncManager(bool streamingEnabled,
             ISynchronizer synchronizer,
@@ -26,10 +28,8 @@ namespace Splitio.Services.Common
             _sseHandler = sseHandler;
             _log = log ?? WrapperAdapter.GetLogger(typeof(Synchronizer));
 
-            _sseHandler.ConnectedEvent += OnProcessFeedbackSSE;
-            _sseHandler.DisconnectEvent += OnProcessFeedbackSSE;
-            notificationManagerKeeper.OccupancyEvent += OnOccupancyEvent;
-            notificationManagerKeeper.PushShutdownEvent += OnPushShutdownEvent;
+            _sseHandler.ActionEvent += OnProcessFeedbackSSE;
+            notificationManagerKeeper.ActionEvent += OnProcessFeedbackSSE;
         }
 
         #region Public Methods
@@ -37,7 +37,7 @@ namespace Splitio.Services.Common
         {
             if (_streamingEnabled)
             {
-                StartStream();
+                 StartStream();
             }
             else
             {
@@ -51,6 +51,35 @@ namespace Splitio.Services.Common
             _synchronizer.ClearFetchersCache();
             _synchronizer.StopPeriodicDataRecording();
             _pushManager.StopSse();
+        }
+
+        // public for tests
+        public void OnProcessFeedbackSSE(object sender, SSEActionsEventArgs e)
+        {
+            _log.Debug($"OnProcessFeedbackSSE Action: {e.Action}");
+
+            switch (e.Action)
+            {
+                case SSEClientActions.CONNECTED:
+                    ProcessConnected();
+                    break;                
+                case SSEClientActions.RETRYABLE_ERROR:
+                    ProcessDisconnect(retry: true);
+                    break;
+                case SSEClientActions.DISCONNECT:
+                case SSEClientActions.NONRETRYABLE_ERROR:
+                    ProcessDisconnect(retry: false);
+                    break;
+                case SSEClientActions.SUBSYSTEM_DOWN:
+                    ProcessSubsystemDown();
+                    break;
+                case SSEClientActions.SUBSYSTEM_READY:
+                    ProcessSubsystemReady();
+                    break;
+                case SSEClientActions.SUBSYSTEM_OFF:
+                    ProcessSubsystemOff();
+                    break;
+            }
         }
         #endregion
 
@@ -68,43 +97,62 @@ namespace Splitio.Services.Common
 
             _synchronizer.StartPeriodicDataRecording();
             _synchronizer.SyncAll();
-            _pushManager.StartSse();
+            Task.Factory.StartNew(async () =>
+            {
+                if (!await _pushManager.StartSse())
+                {
+                    _synchronizer.StartPeriodicFetching();
+                }
+            });
+        }        
+
+        private void ProcessConnected()
+        {
+            if (_streamingConnected)
+            {
+                _log.Debug("Streaming already connected.");
+                return;
+            }
+
+            _streamingConnected = true;
+            _sseHandler.StartWorkers();
+            _synchronizer.SyncAll();
+            _synchronizer.StopPeriodicFetching();
         }
 
-        private void OnProcessFeedbackSSE(object sender, FeedbackEventArgs e)
+        private void ProcessDisconnect(bool retry)
         {
-            if (e.IsConnected)
+            if (!_streamingConnected)
             {
-                _synchronizer.StopPeriodicFetching();
-                _synchronizer.SyncAll();
+                _log.Debug("Streaming already disconnected.");
+                return;
             }
-            else if (e.Reconnect)
+
+            _streamingConnected = false;
+            _sseHandler.StopWorkers();
+            _synchronizer.SyncAll();
+            _synchronizer.StartPeriodicFetching();
+
+            if (retry)
             {
-                _synchronizer.SyncAll();
                 _pushManager.StartSse();
             }
-            else
-            {
-                _synchronizer.StartPeriodicFetching();
-            }
         }
 
-        private void OnOccupancyEvent(object sender, OccupancyEventArgs e)
+        private void ProcessSubsystemDown()
         {
-            if (e.PublisherAvailable)
-            {
-                _synchronizer.StopPeriodicFetching();
-                _synchronizer.SyncAll();
-                _sseHandler.StartWorkers();
-            }
-            else
-            {
-                _sseHandler.StopWorkers();
-                _synchronizer.StartPeriodicFetching();
-            }
+            _sseHandler.StopWorkers();
+            _synchronizer.StartPeriodicFetching();
         }
 
-        private void OnPushShutdownEvent(object sender, EventArgs e)
+        private void ProcessSubsystemReady()
+        {
+            _synchronizer.StopPeriodicFetching();
+            _synchronizer.SyncAll();
+            _sseHandler.StartWorkers();
+        }
+
+        private void ProcessSubsystemOff()
         {
             _pushManager.StopSse();
         }

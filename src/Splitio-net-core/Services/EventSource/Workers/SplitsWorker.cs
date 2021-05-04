@@ -11,12 +11,15 @@ namespace Splitio.Services.EventSource.Workers
 {
     public class SplitsWorker : ISplitsWorker
     {
+        private readonly static int MaxRetriesAllowed = 10;
+
         private readonly ISplitLogger _log;
         private readonly ISplitCache _splitCache;
         private readonly ISynchronizer _synchronizer;
+        private readonly BlockingCollection<long> _queue;
 
-        private BlockingCollection<long> _queue;
         private CancellationTokenSource _cancellationTokenSource;
+        private bool _running;
 
         public SplitsWorker(ISplitCache splitCache,
             ISynchronizer synchronizer,
@@ -25,6 +28,7 @@ namespace Splitio.Services.EventSource.Workers
             _splitCache = splitCache;
             _synchronizer = synchronizer;
             _log = log ?? WrapperAdapter.GetLogger(typeof(SplitsWorker));
+            _queue = new BlockingCollection<long>(new ConcurrentQueue<long>());
         }
 
         #region Public Methods
@@ -32,11 +36,14 @@ namespace Splitio.Services.EventSource.Workers
         {
             try
             {
-                if (_queue != null)
+                if (!_running)
                 {
-                    _log.Debug($"Add to queue: {changeNumber}");
-                    _queue.TryAdd(changeNumber);
+                    _log.Debug("Splits Worker not running.");
+                    return;
                 }
+
+                _log.Debug($"Add to queue: {changeNumber}");
+                _queue.TryAdd(changeNumber);                
             }
             catch (Exception ex)
             {
@@ -48,7 +55,13 @@ namespace Splitio.Services.EventSource.Workers
         {
             try
             {
-                if (_queue != null)
+                if (!_running)
+                {
+                    _log.Debug("Splits Worker not running.");
+                    return;
+                }
+
+                if (changeNumber > _splitCache.GetChangeNumber())
                 {
                     _log.Debug($"Kill Split: {splitName}, changeNumber: {changeNumber} and defaultTreatment: {defaultTreatment}");
                     _splitCache.Kill(changeNumber, splitName, defaultTreatment);
@@ -64,10 +77,16 @@ namespace Splitio.Services.EventSource.Workers
         {
             try
             {
-                _log.Debug("SplitsWorker starting ...");
-                _queue = new BlockingCollection<long>(new ConcurrentQueue<long>());
+                if (_running)
+                {
+                    _log.Debug("Splits Worker already running.");
+                    return;
+                }
+
+                _log.Debug("SplitsWorker starting ...");                
                 _cancellationTokenSource = new CancellationTokenSource();
                 Task.Factory.StartNew(() => ExecuteAsync(), _cancellationTokenSource.Token);
+                _running = true;
             }
             catch (Exception ex)
             {
@@ -79,12 +98,17 @@ namespace Splitio.Services.EventSource.Workers
         {
             try
             {
+                if (!_running)
+                {
+                    _log.Debug("Splits Worker not running.");
+                    return;
+                }
+
                 _cancellationTokenSource?.Cancel();
                 _cancellationTokenSource?.Dispose();
-                _queue?.Dispose();
-                _queue = null;
 
-                _log.Debug("SplitsWorker stoped ...");
+                _log.Debug("SplitsWorker stopped ...");
+                _running = false;
             }
             catch (Exception ex)
             {
@@ -98,16 +122,19 @@ namespace Splitio.Services.EventSource.Workers
         {
             try
             {
-                while (!_cancellationTokenSource.IsCancellationRequested)
+                while (!_cancellationTokenSource.IsCancellationRequested && _running)
                 {
-                    //Wait indefinitely until a segment is queued
+                    // Wait indefinitely until a segment is queued
                     if (_queue.TryTake(out long changeNumber, -1))
                     {
                         _log.Debug($"ChangeNumber dequeue: {changeNumber}");
 
-                        if (changeNumber > _splitCache.GetChangeNumber())
+                        var attempt = 0;
+
+                        while (changeNumber > _splitCache.GetChangeNumber() && (attempt < MaxRetriesAllowed))
                         {
                             await _synchronizer.SynchronizeSplits();
+                            attempt++;
                         }
                     }
                 }

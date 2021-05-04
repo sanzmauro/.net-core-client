@@ -11,12 +11,15 @@ namespace Splitio.Services.EventSource.Workers
 {
     public class SegmentsWorker : ISegmentsWorker
     {
+        private readonly static int MaxRetriesAllowed = 10;
+
         private readonly ISplitLogger _log;
         private readonly ISegmentCache _segmentCache;
         private readonly ISynchronizer _synchronizer;
+        private readonly BlockingCollection<SegmentQueueDto> _queue;
 
-        private BlockingCollection<SegmentQueueDto> _queue;
         private CancellationTokenSource _cancellationTokenSource;
+        private bool _running;
 
         public SegmentsWorker(ISegmentCache segmentCache,
             ISynchronizer synchronizer,
@@ -24,7 +27,8 @@ namespace Splitio.Services.EventSource.Workers
         {
             _segmentCache = segmentCache;
             _synchronizer = synchronizer;
-            _log = log ?? WrapperAdapter.GetLogger(typeof(SegmentsWorker));            
+            _log = log ?? WrapperAdapter.GetLogger(typeof(SegmentsWorker));
+            _queue = new BlockingCollection<SegmentQueueDto>(new ConcurrentQueue<SegmentQueueDto>());
         }
 
         #region Public Methods
@@ -32,11 +36,14 @@ namespace Splitio.Services.EventSource.Workers
         {
             try
             {
-                if (_queue != null)
+                if (!_running)
                 {
-                    _log.Debug($"Add to queue: {segmentName} - {changeNumber}");
-                    _queue.TryAdd(new SegmentQueueDto { ChangeNumber = changeNumber, SegmentName = segmentName });
+                    _log.Error("Segments Worker not running.");
+                    return;
                 }
+
+                _log.Debug($"Add to queue: {segmentName} - {changeNumber}");
+                _queue.TryAdd(new SegmentQueueDto { ChangeNumber = changeNumber, SegmentName = segmentName });
             }
             catch (Exception ex)
             {
@@ -48,10 +55,16 @@ namespace Splitio.Services.EventSource.Workers
         {
             try
             {
+                if (_running)
+                {
+                    _log.Error("Segments Worker already running.");
+                    return;
+                }
+
                 _log.Debug($"Segments worker starting ...");
-                _queue = new BlockingCollection<SegmentQueueDto>(new ConcurrentQueue<SegmentQueueDto>());
                 _cancellationTokenSource = new CancellationTokenSource();
                 Task.Factory.StartNew(() => Execute(), _cancellationTokenSource.Token);
+                _running = true;
             }
             catch (Exception ex)
             {
@@ -63,11 +76,17 @@ namespace Splitio.Services.EventSource.Workers
         {
             try
             {
+                if (!_running)
+                {
+                    _log.Error("Segments Worker not running.");
+                    return;
+                }
+
                 _cancellationTokenSource?.Cancel();
                 _cancellationTokenSource?.Dispose();
-                _queue?.Dispose();
-                _queue = null;
+
                 _log.Debug($"Segments worker stoped ...");
+                _running = false;
             }
             catch (Exception ex)
             {
@@ -83,14 +102,17 @@ namespace Splitio.Services.EventSource.Workers
             {
                 while (!_cancellationTokenSource.IsCancellationRequested)
                 {
-                    //Wait indefinitely until a segment is queued
+                    // Wait indefinitely until a segment is queued
                     if (_queue.TryTake(out SegmentQueueDto segment, -1))
                     {
                         _log.Debug($"Segment dequeue: {segment.SegmentName}");
 
-                        if (segment.ChangeNumber > _segmentCache.GetChangeNumber(segment.SegmentName))
+                        var attempt = 0;
+
+                        while (segment.ChangeNumber > _segmentCache.GetChangeNumber(segment.SegmentName) && (attempt < MaxRetriesAllowed))
                         {
                             await _synchronizer.SynchronizeSegment(segment.SegmentName);
+                            attempt++;
                         }
                     }
                 }

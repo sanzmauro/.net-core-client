@@ -4,6 +4,7 @@ using Splitio.Services.Logger;
 using Splitio.Services.SegmentFetcher.Interfaces;
 using Splitio.Services.Shared.Classes;
 using Splitio.Services.Shared.Interfaces;
+using System;
 using System.Collections.Concurrent;
 using System.Threading;
 using System.Threading.Tasks;
@@ -17,6 +18,7 @@ namespace Splitio.Services.SegmentFetcher.Classes
         private readonly ISegmentChangeFetcher _segmentChangeFetcher;
         private readonly IReadinessGatesCache _gates;
         private readonly IWrapperAdapter _wrappedAdapter;
+        private readonly ISegmentTaskQueue _segmentTaskQueue;
         private readonly ConcurrentDictionary<string, SelfRefreshingSegment> _segments;
         private readonly SegmentTaskWorker _worker;
         private readonly CancellationTokenSource _cancelTokenSource;
@@ -26,16 +28,18 @@ namespace Splitio.Services.SegmentFetcher.Classes
             IReadinessGatesCache gates, 
             int interval, 
             ISegmentCache segmentsCache, 
-            int numberOfParallelSegments) : base(segmentsCache)
+            int numberOfParallelSegments,
+            ISegmentTaskQueue segmentTaskQueue) : base(segmentsCache)
         {
             _cancelTokenSource = new CancellationTokenSource();
 
             _segmentChangeFetcher = segmentChangeFetcher;
             _segments = new ConcurrentDictionary<string, SelfRefreshingSegment>();
-            _worker = new SegmentTaskWorker(numberOfParallelSegments);
+            _worker = new SegmentTaskWorker(numberOfParallelSegments, segmentTaskQueue);
             _interval = interval;
             _gates = gates;
             _wrappedAdapter = new WrapperAdapter();
+            _segmentTaskQueue = segmentTaskQueue;
 
             StartWorker();
         }
@@ -69,7 +73,7 @@ namespace Splitio.Services.SegmentFetcher.Classes
 
         public void Clear()
         {
-            SegmentTaskQueue.segmentsQueue.Dispose();
+            _segmentTaskQueue.Dispose();
             _segments.Clear();
             _segmentCache.Clear();
         }
@@ -82,14 +86,15 @@ namespace Splitio.Services.SegmentFetcher.Classes
             {
                 segment = new SelfRefreshingSegment(name, _segmentChangeFetcher, _gates, _segmentCache);
 
-                _segments.TryAdd(name, segment);
-
-                SegmentTaskQueue.segmentsQueue.TryAdd(segment);
-
-                if (_log.IsDebugEnabled)
+                if (_segments.TryAdd(name, segment))
                 {
-                    _log.Debug($"Segment queued: {segment.Name}");
-                }
+                    _segmentTaskQueue.Add(segment);
+
+                    if (_log.IsDebugEnabled)
+                    {
+                        _log.Debug($"Segment queued: {segment.Name}");
+                    }
+                }                
             }
         }
 
@@ -105,8 +110,16 @@ namespace Splitio.Services.SegmentFetcher.Classes
 
         public async Task Fetch(string segmentName)
         {
-            var refreshingSegment = new SelfRefreshingSegment(segmentName, _segmentChangeFetcher, _gates, _segmentCache);
-            await refreshingSegment.FetchSegment();
+            try
+            {
+                InitializeSegment(segmentName);
+                _segments.TryGetValue(segmentName, out SelfRefreshingSegment fetcher);
+                await fetcher.FetchSegment();
+            }
+            catch (Exception ex)
+            {
+                _log.Error($"Segment {segmentName} is not initialized. {ex.Message}");
+            }
         }
         #endregion
 
@@ -115,7 +128,7 @@ namespace Splitio.Services.SegmentFetcher.Classes
         {
             foreach (var segment in _segments.Values)
             {
-                SegmentTaskQueue.segmentsQueue.TryAdd(segment);
+                _segmentTaskQueue.Add(segment);
 
                 if (_log.IsDebugEnabled)
                 {
